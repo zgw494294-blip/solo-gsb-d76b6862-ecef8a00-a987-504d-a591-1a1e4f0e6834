@@ -410,6 +410,52 @@
     </div>
   </section>
 
+  <section class="card" id="mixtureCard" style="margin-top:18px;">
+    <h2>混合样本配比反推</h2>
+    <div class="legend" style="margin-bottom:10px;">
+      录入 <strong>2～5 份已知线性 DNA</strong>（各 <strong>4～5000 bp</strong>、仅 A/C/G/T，空白自动忽略），
+      <strong>共用上方 1～8 条现有酶规则</strong>（识别串不得长于任一样本），按既有规则做<strong>完全酶切</strong>
+      （<strong>不计单点概率</strong>）。每份样本把<strong>同长度片段的碱基数相加后除以该样本全长</strong>，
+      得到单位 DNA 质量的条带份额；混合物的预测份额为各样本条带份额按<strong>连续质量配比</strong>的加权和。
+      录入各预测长度对应的<strong>观测份额</strong>（长度不得重复、份额非负且总和为 1；<strong>遗漏长度视为 0</strong>），
+      要求逐行绝对误差不超过 <strong>0～0.05</strong> 的输入容差。求解配比的连续可行域（两阶段单纯形，<strong>不用离散网格</strong>），
+      返回一组可行配比与各样本配比的最小/最大值及对应预测条带；全部样本出现过的不同长度<strong>超过 40 种时拒绝</strong>。
+    </div>
+    <div id="mixSamples"></div>
+    <div class="toolbar">
+      <span class="legend">各样本均按线性处理；线性两端 0/n 为固定端点，端点命中不另增片段。</span>
+      <button class="btn" id="addMixSample" type="button">+ 添加样本</button>
+    </div>
+    <table class="enzyme-table" style="margin-top:10px;">
+      <thead>
+        <tr>
+          <th style="width:30%">预测长度 (bp，正整数)</th>
+          <th style="width:42%">观测份额（≥ 0，各行总和为 1；遗漏长度视为 0）</th>
+          <th style="width:28%"></th>
+        </tr>
+      </thead>
+      <tbody id="mixRows"></tbody>
+    </table>
+    <div class="toolbar">
+      <span class="legend">只能录入完全酶切后确实出现的预测长度；未录入的预测长度按观测份额 0 参与约束。</span>
+      <button class="btn" id="addMixRow" type="button">+ 添加观测行</button>
+    </div>
+    <div class="infer-grid" style="margin-top:10px;">
+      <div class="cell narrow">
+        <label class="field" for="mixTolerance">输入容差（0～0.05）</label>
+        <input id="mixTolerance" type="number" min="0" max="0.05" step="0.005" value="0.02">
+      </div>
+    </div>
+    <div class="run-row" style="margin-top:10px;">
+      <button class="btn primary" id="runMixture" type="button">反推混合配比</button>
+    </div>
+  </section>
+
+  <section class="card" id="mixtureResults" style="margin-top:18px; display:none;">
+    <h2>混合样本配比反推结果</h2>
+    <div id="mixtureBody"></div>
+  </section>
+
   <section class="card" id="discriminationResults" style="margin-top:18px; display:none;">
     <h2>样本鉴别酶组合结果</h2>
     <div id="discriminationBody"></div>
@@ -1916,6 +1962,291 @@ document.getElementById("runCalibration").addEventListener("click", () => {
     buildCalibrationRequest);
 });
 
+// ---------- 混合样本配比反推 ----------
+const mixSamplesContainer = document.getElementById("mixSamples");
+let mixSampleSeq = 0;
+
+function renumberMixSamples() {
+  for (let i = 0; i < mixSamplesContainer.children.length; i++) {
+    mixSamplesContainer.children[i].querySelector(".mix-sample-title")
+      .textContent = `样本 ${i + 1}`;
+  }
+}
+
+function addMixSample(seq = "") {
+  if (mixSamplesContainer.children.length >= 5) {
+    alert("最多录入 5 份样本");
+    return;
+  }
+  mixSampleSeq += 1;
+  const div = document.createElement("div");
+  div.className = "rule-sample";
+  div.innerHTML =
+    '<div class="rule-sample-head"><strong class="mix-sample-title"></strong>' +
+    '<button class="btn del" type="button">删除</button></div>' +
+    '<label class="field">线性 DNA 序列（4～5000 bp A/C/G/T，空白自动忽略）</label>' +
+    '<textarea class="mx-seq" rows="2" spellcheck="false" placeholder="粘贴已知线性 DNA 序列"></textarea>' +
+    '<div class="meta">当前长度：<strong class="mx-len">0</strong> bp（按线性处理）</div>';
+  const seqInput = div.querySelector(".mx-seq");
+  const lenSpan = div.querySelector(".mx-len");
+  seqInput.value = seq;
+  lenSpan.textContent = seq.replace(/\s+/g, "").length;
+  seqInput.addEventListener("input", () => {
+    lenSpan.textContent = seqInput.value.replace(/\s+/g, "").length;
+  });
+  div.querySelector(".del").addEventListener("click", () => {
+    if (mixSamplesContainer.children.length <= 2) {
+      alert("至少保留 2 份样本");
+      return;
+    }
+    div.remove();
+    renumberMixSamples();
+  });
+  mixSamplesContainer.appendChild(div);
+  renumberMixSamples();
+}
+
+document.getElementById("addMixSample").addEventListener("click", () => addMixSample());
+
+const mixRowsBody = document.getElementById("mixRows");
+
+function addMixRow(length = "", share = "") {
+  if (mixRowsBody.rows.length >= 40) {
+    alert("最多录入 40 条观测行");
+    return;
+  }
+  const tr = document.createElement("tr");
+  tr.innerHTML =
+    '<td><input class="m-len" type="number" min="1" step="1" placeholder="如 6"></td>' +
+    '<td><input class="m-share" type="number" min="0" max="1" step="any" placeholder="如 0.2"></td>' +
+    '<td><button class="btn del" type="button">删除</button></td>';
+  tr.querySelector(".m-len").value = length;
+  tr.querySelector(".m-share").value = share;
+  tr.querySelector(".del").addEventListener("click", () => {
+    if (mixRowsBody.rows.length <= 1) {
+      alert("至少保留 1 条观测行");
+      return;
+    }
+    tr.remove();
+  });
+  mixRowsBody.appendChild(tr);
+}
+
+document.getElementById("addMixRow").addEventListener("click", () => addMixRow());
+
+function buildMixtureRequest() {
+  // 样本：2～5 份线性 DNA，4～5000 bp
+  const count = mixSamplesContainer.children.length;
+  if (count < 2 || count > 5) {
+    throw new Error(`样本数量须为 2～5 份（当前 ${count} 份）`);
+  }
+  const samples = [];
+  for (let i = 0; i < count; i++) {
+    const div = mixSamplesContainer.children[i];
+    const label = `样本 ${i + 1}`;
+    const sequence = div.querySelector(".mx-seq").value.replace(/\s+/g, "").toUpperCase();
+    if (sequence.length < 4 || sequence.length > 5000) {
+      throw new Error(`${label} 的 DNA 长度须为 4～5000 bp（当前 ${sequence.length} bp）`);
+    }
+    if (!DNA_RE.test(sequence)) {
+      throw new Error(`${label} 的 DNA 序列只能包含 A、C、G、T 字符`);
+    }
+    samples.push({ sequence });
+  }
+  const minSampleLen = Math.min(...samples.map((s) => s.sequence.length));
+
+  // 共用上方酶规则；反推做完全酶切，不校验、不上传概率
+  if (enzymeRows.rows.length < 1 || enzymeRows.rows.length > 8) {
+    throw new Error(`酶规则数量须为 1～8 条（当前 ${enzymeRows.rows.length} 条）`);
+  }
+  const seen = new Set();
+  const enzymes = [];
+  for (const row of enzymeRows.rows) {
+    const id = row.querySelector(".e-id").value.trim();
+    const site = row.querySelector(".e-site").value.replace(/\s+/g, "").toUpperCase();
+    const offsetRaw = row.querySelector(".e-offset").value.trim();
+    const offset = Number(offsetRaw);
+    if (!id) throw new Error("每条酶规则都必须填写 ID");
+    if (seen.has(id)) throw new Error(`酶 ID 重复：${id}`);
+    seen.add(id);
+    if (site.length < 3 || site.length > 12) {
+      throw new Error(`酶 ${id} 的识别串长度须为 3～12 位（当前 ${site.length} 位）`);
+    }
+    if (!IUPAC_RE.test(site)) {
+      throw new Error(`酶 ${id} 的识别串含非法 IUPAC 字符`);
+    }
+    if (site.length > minSampleLen) {
+      throw new Error(`酶 ${id} 的识别串（${site.length} 位）长于最短样本（${minSampleLen} bp）：识别串不得长于任一样本`);
+    }
+    if (offsetRaw === "" || !Number.isInteger(offset) || offset < 0 || offset > site.length) {
+      throw new Error(`酶 ${id} 的切割偏移须为 0～${site.length} 的整数`);
+    }
+    enzymes.push({ id, site, offset });
+  }
+
+  // 观测行：1～40 条，长度为正整数且不重复，份额非负，总和为 1
+  const rowCount = mixRowsBody.rows.length;
+  if (rowCount < 1 || rowCount > 40) {
+    throw new Error(`观测行数量须为 1～40 条（当前 ${rowCount} 条）`);
+  }
+  const observations = [];
+  const seenLengths = new Set();
+  let shareTotal = 0;
+  for (let i = 0; i < rowCount; i++) {
+    const tr = mixRowsBody.rows[i];
+    const label = `第 ${i + 1} 行`;
+    const lenRaw = tr.querySelector(".m-len").value.trim();
+    const length = Number(lenRaw);
+    if (lenRaw === "" || !Number.isInteger(length) || length < 1) {
+      throw new Error(`${label} 的预测长度须为 ≥ 1 的正整数`);
+    }
+    if (seenLengths.has(length)) {
+      throw new Error(`${label} 的预测长度 ${length} 与之前的行重复`);
+    }
+    seenLengths.add(length);
+    const shareRaw = tr.querySelector(".m-share").value.trim();
+    const share = Number(shareRaw);
+    if (shareRaw === "" || !Number.isFinite(share) || share < 0) {
+      throw new Error(`${label} 的观测份额须为非负有限数`);
+    }
+    shareTotal += share;
+    observations.push({ length, share });
+  }
+  if (Math.abs(shareTotal - 1) > 1e-6) {
+    throw new Error(`全部观测份额之和须为 1（当前 ${shareTotal}）；遗漏的预测长度按份额 0 计，不需要显式录入`);
+  }
+
+  const tolRaw = document.getElementById("mixTolerance").value.trim();
+  const tolerance = Number(tolRaw);
+  if (tolRaw === "" || !Number.isFinite(tolerance) || tolerance < 0 || tolerance > 0.05) {
+    throw new Error("输入容差须为 0～0.05 之间的数");
+  }
+
+  return { samples, enzymes, observations, tolerance };
+}
+
+function renderMixture(data) {
+  const body = document.getElementById("mixtureBody");
+
+  const sampleCells = data.samples.map((s) => `<tr>
+      <td>${s.index}</td>
+      <td>线性</td>
+      <td>${s.length}</td>
+      <td>${s.cut_count}</td>
+      <td>${s.fragment_count}</td>
+      <td><code class="seq">[${s.fragment_lengths.join(", ")}]</code></td>
+    </tr>`).join("");
+  const samplesHtml =
+    `<h2 style="margin-top:8px;">样本完全酶切（线性，忽略单点概率）</h2>`
+    + `<table><thead><tr>`
+    + `<th style="width:7%">样本</th><th style="width:9%">拓扑</th><th style="width:10%">长度 (bp)</th>`
+    + `<th style="width:12%">切点数</th><th style="width:12%">片段数</th><th>片段长度（升序，重复保留）</th>`
+    + `</tr></thead><tbody>${sampleCells}</tbody></table>`;
+
+  const headChips = [
+    `<span class="chip">样本数：${data.sample_count}</span>`,
+    `<span class="chip">共用酶：${data.enzyme_count} 条（${data.enzyme_ids.map(escapeHtml).join("、")}）</span>`,
+    `<span class="chip">预测长度种数：${data.predicted_length_count}（上限 40）</span>`,
+    `<span class="chip">录入观测行：${data.observation_row_count} 条</span>`,
+    `<span class="chip">输入容差：±${data.tolerance}</span>`,
+  ];
+
+  if (!data.solvable) {
+    body.innerHTML =
+      `<div class="summary">${headChips.join("")}</div>`
+      + samplesHtml
+      + `<div class="infer-warn"><strong>无解：</strong>${escapeHtml(data.message.replace(/^无解：/, ""))}</div>`
+      + (data.minimal_max_error !== null
+        ? `<div class="legend">连续可行域为空（配比非负且总和为 1）；上述“最小最大行误差”由线性规划求得，非网格近似。</div>`
+        : "");
+    document.getElementById("mixtureResults").style.display = "block";
+    return;
+  }
+
+  const fm = data.feasible_mixture;
+  // 长度 × 样本 的单位质量条带份额矩阵 + 观测/预测行
+  const weightHeader = data.samples
+    .map((s, j) => `<th>样本 ${s.index} 份额 × ${fmtNum(fm.weights[j])}</th>`)
+    .join("");
+  const bandRows = fm.predicted_bands.map((b) => {
+    const cells = b.sample_shares.map((v) => `<td>${fmtNum(v)}</td>`).join("");
+    const flag = b.within_tolerance
+      ? '<span class="tag" style="background:#e8f5e9;border-color:#a5d6a7;color:#2e7d32;">满足</span>'
+      : '<span class="tag" style="background:#ffebee;border-color:#ef9a9a;color:#c62828;">超限</span>';
+    return `<tr>
+      <td>${b.length}</td>
+      ${cells}
+      <td>${fmtNum(b.observed_share)}</td>
+      <td><strong>${fmtNum(b.predicted_share)}</strong></td>
+      <td>${fmtNum(b.abs_error)}</td>
+      <td>${flag}</td>
+    </tr>`;
+  }).join("");
+
+  const weightChips = fm.weights
+    .map((w, j) => `<span class="chip">样本 ${j + 1}：<strong>${fmtNum(w)}</strong></span>`)
+    .join("");
+
+  const rangeRows = data.sample_ranges.map((r) => {
+    const wmin = r.min.weights.map((w) => fmtNum(w)).join("，");
+    const wmax = r.max.weights.map((w) => fmtNum(w)).join("，");
+    return `<tr>
+      <td><strong>样本 ${r.sample_index}</strong></td>
+      <td>${fmtNum(r.min.value)}</td>
+      <td><code class="seq">[${wmin}]</code></td>
+      <td>${fmtNum(r.max.value)}</td>
+      <td><code class="seq">[${wmax}]</code></td>
+    </tr>`;
+  }).join("");
+
+  // 端点预测条带：每个样本两段（最小值/最大值），紧凑列出长度→预测份额
+  const endpointSections = data.sample_ranges.map((r) => {
+    const fmtBands = (bands) => bands
+      .map((b) => `${b.length} bp→${fmtNum(b.predicted_share)}（误差 ${fmtNum(b.abs_error)}）`)
+      .join("；");
+    return `<tr>
+      <td>样本 ${r.sample_index} 取最小值 ${fmtNum(r.min.value)}</td>
+      <td>${fmtBands(r.min.predicted_bands)}</td>
+    </tr>
+    <tr>
+      <td>样本 ${r.sample_index} 取最大值 ${fmtNum(r.max.value)}</td>
+      <td>${fmtBands(r.max.predicted_bands)}</td>
+    </tr>`;
+  }).join("");
+
+  body.innerHTML =
+    `<div class="summary">${headChips.join("")}</div>`
+    + samplesHtml
+    + `<h2 style="margin-top:16px;">一组可行配比（两阶段单纯形求得的可行顶点）</h2>`
+    + `<div class="summary">${weightChips}`
+    + `<span class="chip">该配比最大行误差：<strong>${fmtNum(fm.max_error)}</strong>（≤ ±${data.tolerance}）</span></div>`
+    + `<table><thead><tr>`
+    + `<th style="width:8%">长度 (bp)</th>${weightHeader}`
+    + `<th style="width:12%">观测份额</th><th style="width:12%">预测份额</th>`
+    + `<th style="width:10%">绝对误差</th><th style="width:9%">行判定</th>`
+    + `</tr></thead><tbody>${bandRows}</tbody></table>`
+    + `<div class="legend">各样本列为“单位 DNA 质量的条带份额”＝同长度片段碱基数之和 ÷ 样本全长；`
+    + `预测份额＝各样本份额按可行配比加权和；未录入的预测长度其观测份额按 0 显示。</div>`
+    + `<h2 style="margin-top:16px;">各样本可行配比范围（连续可行域上的最小值 / 最大值）</h2>`
+    + `<table><thead><tr>`
+    + `<th style="width:14%">样本</th><th style="width:13%">最小值</th>`
+    + `<th style="width:24%">取最小值时的全部样本配比</th>`
+    + `<th style="width:13%">最大值</th><th style="width:24%">取最大值时的全部样本配比</th>`
+    + `</tr></thead><tbody>${rangeRows}</tbody></table>`
+    + `<h2 style="margin-top:16px;">各端点对应的预测条带（长度→预测份额，逐行误差均 ≤ ±${data.tolerance}）</h2>`
+    + `<table><thead><tr><th style="width:34%">端点</th><th>预测条带</th></tr></thead>`
+    + `<tbody>${endpointSections}</tbody></table>`
+    + `<div class="legend">配比非负且总和为 1；可行域为凸多面体，全部端点与范围由线性规划精确求得，<strong>未使用离散网格近似</strong>。</div>`;
+
+  document.getElementById("mixtureResults").style.display = "block";
+}
+
+document.getElementById("runMixture").addEventListener("click", () => {
+  const btn = document.getElementById("runMixture");
+  runCalculation(btn, "反推混合配比", "/api/mixture-deconvolution", renderMixture,
+    buildMixtureRequest);
+});
+
 // 预置一条示例酶并填入示例序列，方便直接试用
 addEnzymeRow("EcoRV-like", "GATATC", "3", "0.8");
 sequenceInput.value = "AAAGATATCGGGGATATCTTTGATATCAAA";
@@ -1935,6 +2266,14 @@ addDiscSample("TTGATATCAA", "circular");
 addCalibRow("6", "fragment", "1.6");
 addCalibRow("9", "fragment", "1.28");
 addCalibRow("15", "fragment", "0.32");
+// 混合样本配比反推示例：样本 1（30bp，6bp 份额 0.4、9bp 份额 0.6）与
+// 样本 2（10bp，5bp 份额 1.0），50/50 混合 → 5bp 0.5、6bp 0.2、9bp 0.3
+addMixSample("AAAGATATCGGGGATATCTTTGATATCAAA");
+addMixSample("TTGATATCAA");
+addMixRow("5", "0.5");
+addMixRow("6", "0.2");
+addMixRow("9", "0.3");
+
 </script>
 </body>
 </html>

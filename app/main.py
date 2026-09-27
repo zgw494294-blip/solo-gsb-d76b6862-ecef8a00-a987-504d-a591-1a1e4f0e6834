@@ -59,6 +59,19 @@ from .inference import (
     digest_inference,
 )
 from .isolation import MAX_SPACING, MIN_SPACING, fragment_isolation
+from .mixture import (
+    MAX_OBSERVATIONS as MIX_MAX_OBSERVATIONS,
+    MAX_SAMPLE_LEN as MIX_MAX_SAMPLE_LEN,
+    MAX_SAMPLES as MIX_MAX_SAMPLES,
+    MAX_TOLERANCE as MIX_MAX_TOLERANCE,
+    MIN_OBSERVATIONS as MIX_MIN_OBSERVATIONS,
+    MIN_SAMPLE_LEN as MIX_MIN_SAMPLE_LEN,
+    MIN_SAMPLES as MIX_MIN_SAMPLES,
+    MIN_TOLERANCE as MIX_MIN_TOLERANCE,
+    SUM_TOLERANCE as MIX_SUM_TOLERANCE,
+    MixtureInputError,
+    mixture_deconvolution,
+)
 from .redesign import RedesignInputError, synonymous_redesign
 from .rule_inference import (
     MAX_SAMPLE_LEN,
@@ -68,7 +81,7 @@ from .rule_inference import (
     enzyme_rule_inference,
 )
 
-app = FastAPI(title="DNA 虚拟平切酶酶切图谱", version="1.9.0")
+app = FastAPI(title="DNA 虚拟平切酶酶切图谱", version="1.10.0")
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -175,6 +188,24 @@ class SampleDiscriminationRequest(BaseModel):
     samples: list[SampleDiscriminationSample]
     enzymes: list[EnzymeRule]  # 鉴别做完全酶切，忽略单点切开概率
     tolerance: int = 0
+
+
+class MixtureDeconvolutionSample(BaseModel):
+    # 混合样本配比反推只处理已知线性 DNA
+    sequence: str
+
+
+class MixtureObservationRow(BaseModel):
+    # 一种预测长度对应的观测份额（未录入的预测长度视为 0）
+    length: int
+    share: float
+
+
+class MixtureDeconvolutionRequest(BaseModel):
+    samples: list[MixtureDeconvolutionSample]
+    enzymes: list[EnzymeRule]  # 反推做完全酶切，忽略单点切开概率
+    observations: list[MixtureObservationRow]
+    tolerance: float = 0.0
 
 
 class CalibrationRow(BaseModel):
@@ -720,6 +751,138 @@ def sample_discrimination_api(request: SampleDiscriminationRequest) -> dict:
         request.samples, request.enzymes, request.tolerance
     )
     return sample_discrimination(samples, enzymes, tolerance)
+
+
+def _normalize_mixture_inputs(
+    raw_samples: list[MixtureDeconvolutionSample],
+    raw_enzymes: list[EnzymeRule],
+    raw_observations: list[MixtureObservationRow],
+    raw_tolerance: float,
+) -> tuple[list[dict], list[dict], list[dict], float]:
+    """/api/mixture-deconvolution 的样本、共用酶、观测份额与容差校验。
+
+    2～5 份已知线性 DNA（各 4～5000 bp、仅 A/C/G/T），共用 1～8 条现有
+    格式的酶规则（识别串不得长于任一样本）；1～40 条观测行，长度为正整数
+    且不得重复，份额为非负有限数、总和为 1（遗漏长度由计算模块补 0）；
+    容差为 0～0.05 的有限数。观测长度是否为预测长度、预测长度种数是否
+    超过 40 由计算模块按实际酶切结果判定。
+    """
+    # ---- 线性 DNA 样本 ----
+    if not MIX_MIN_SAMPLES <= len(raw_samples) <= MIX_MAX_SAMPLES:
+        raise _bad_request(
+            f"样本数量须为 {MIX_MIN_SAMPLES}～{MIX_MAX_SAMPLES} 份"
+            f"（当前 {len(raw_samples)} 份）"
+        )
+
+    samples: list[dict] = []
+    for index, raw in enumerate(raw_samples, start=1):
+        sequence = WHITESPACE_RE.sub("", raw.sequence).upper()
+        if not MIX_MIN_SAMPLE_LEN <= len(sequence) <= MIX_MAX_SAMPLE_LEN:
+            raise _bad_request(
+                f"样本 {index} 的 DNA 长度须为 {MIX_MIN_SAMPLE_LEN}～"
+                f"{MIX_MAX_SAMPLE_LEN} bp（当前 {len(sequence)} bp）"
+            )
+        if not DNA_RE.fullmatch(sequence):
+            raise _bad_request(f"样本 {index} 的 DNA 序列只能包含 A、C、G、T 字符")
+        samples.append({"sequence": sequence})
+
+    min_sample_len = min(len(sample["sequence"]) for sample in samples)
+
+    # ---- 共用酶规则（现有格式；识别串不得长于任一样本） ----
+    if not MIN_ENZYMES <= len(raw_enzymes) <= MAX_ENZYMES:
+        raise _bad_request(
+            f"酶规则数量须为 {MIN_ENZYMES}～{MAX_ENZYMES} 条（当前 {len(raw_enzymes)} 条）"
+        )
+
+    enzymes: list[dict] = []
+    seen_ids: set[str] = set()
+    for raw in raw_enzymes:
+        enzyme_id = raw.id.strip()
+        if not enzyme_id:
+            raise _bad_request("每条酶规则都必须填写唯一 ID")
+        if enzyme_id in seen_ids:
+            raise _bad_request(f"酶 ID 重复：{enzyme_id}")
+        seen_ids.add(enzyme_id)
+
+        site = WHITESPACE_RE.sub("", raw.site).upper()
+        if not MIN_SITE_LEN <= len(site) <= MAX_SITE_LEN:
+            raise _bad_request(
+                f"酶 {enzyme_id} 的识别串长度须为 {MIN_SITE_LEN}～{MAX_SITE_LEN} 位"
+            )
+        if not IUPAC_RE.fullmatch(site):
+            raise _bad_request(
+                f"酶 {enzyme_id} 的识别串含非法字符，仅允许 IUPAC 码："
+                "A C G T R Y S W K M B D H V N"
+            )
+        if len(site) > min_sample_len:
+            raise _bad_request(
+                f"酶 {enzyme_id} 的识别串（{len(site)} 位）不能长于任一样本"
+                f"（当前最短样本 {min_sample_len} bp）"
+            )
+        if not isinstance(raw.offset, int) or not 0 <= raw.offset <= len(site):
+            raise _bad_request(f"酶 {enzyme_id} 的切割偏移须为 0～{len(site)} 的整数")
+
+        enzymes.append({"id": enzyme_id, "site": site, "offset": raw.offset})
+
+    # ---- 观测份额行 ----
+    if not MIX_MIN_OBSERVATIONS <= len(raw_observations) <= MIX_MAX_OBSERVATIONS:
+        raise _bad_request(
+            f"观测行数量须为 {MIX_MIN_OBSERVATIONS}～{MIX_MAX_OBSERVATIONS} 条"
+            f"（当前 {len(raw_observations)} 条；未录入的预测长度其观测份额视为 0）"
+        )
+
+    observations: list[dict] = []
+    seen_lengths: set[int] = set()
+    share_total = 0.0
+    for index, raw in enumerate(raw_observations, start=1):
+        length = raw.length
+        if not isinstance(length, int) or isinstance(length, bool):
+            raise _bad_request(f"第 {index} 行的预测长度须为整数")
+        if length < 1:
+            raise _bad_request(f"第 {index} 行的预测长度须为正整数（≥ 1 bp）")
+        if length in seen_lengths:
+            raise _bad_request(f"第 {index} 行的预测长度 {length} 与之前的行重复")
+        seen_lengths.add(length)
+
+        share = raw.share
+        if not isinstance(share, (int, float)) or isinstance(share, bool):
+            raise _bad_request(f"第 {index} 行的观测份额须为数值")
+        share = float(share)
+        if not math.isfinite(share) or share < 0.0:
+            raise _bad_request(f"第 {index} 行的观测份额须为非负有限数")
+        share_total += share
+        observations.append({"length": length, "share": share})
+
+    if abs(share_total - 1.0) > MIX_SUM_TOLERANCE:
+        raise _bad_request(
+            f"全部观测份额之和须为 1（当前 {share_total:.12g}）；"
+            "遗漏的预测长度按份额 0 计，不需要显式录入"
+        )
+
+    # ---- 容差 ----
+    if not isinstance(raw_tolerance, (int, float)) or isinstance(raw_tolerance, bool):
+        raise _bad_request("输入容差须为数值")
+    tolerance = float(raw_tolerance)
+    if not math.isfinite(tolerance) or not (
+        MIX_MIN_TOLERANCE <= tolerance <= MIX_MAX_TOLERANCE
+    ):
+        raise _bad_request(
+            f"输入容差须为 {MIX_MIN_TOLERANCE:g}～{MIX_MAX_TOLERANCE:g} 的有限数"
+            f"（当前 {raw_tolerance}）"
+        )
+
+    return samples, enzymes, observations, tolerance
+
+
+@app.post("/api/mixture-deconvolution")
+def mixture_deconvolution_api(request: MixtureDeconvolutionRequest) -> dict:
+    samples, enzymes, observations, tolerance = _normalize_mixture_inputs(
+        request.samples, request.enzymes, request.observations, request.tolerance
+    )
+    try:
+        return mixture_deconvolution(samples, enzymes, observations, tolerance)
+    except MixtureInputError as exc:
+        raise _bad_request(str(exc)) from exc
 
 
 def _normalize_calibration_rows(
