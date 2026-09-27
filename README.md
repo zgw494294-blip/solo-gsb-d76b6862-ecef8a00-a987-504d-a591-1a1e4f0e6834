@@ -14,8 +14,8 @@ docker compose up --build
 **http://localhost:8000**
 
 单页内包含全部功能区块：完全酶切、部分酶切丰度分析、同义移除位点、观测条带反推、
-目标片段分离设计、平切片段拼接、环状双酶图谱重建、未知酶规则反推、样本鉴别酶组合
-与酶活性校准；各 HTTP API 见下文。
+目标片段分离设计、平切片段拼接、环状双酶图谱重建、未知酶规则反推、样本鉴别酶组合、
+酶活性校准与混合样本配比反推；各 HTTP API 见下文。
 
 停止：`Ctrl+C`（后台运行则用 `docker compose down`）。
 
@@ -171,6 +171,26 @@ docker compose up --build
     及其 min / max）；每条酶的切点只扫描一次、按 O(m²) 区间概率求和，
     **不枚举 2^m 种切开状态**；无解时 HTTP 200 返回 `solvable: false` 与明确说明
     （含所有组合的最大行误差最小值）。
+- **混合样本配比反推**（页面区块“混合样本配比反推”/ `POST /api/mixture-deconvolution`）：
+  - 录入 **2～5 份**已知**线性** DNA（各 **4～5000 bp**、仅 A/C/G/T，空白自动忽略）
+    与**共用 1～8 条现有酶规则**（识别串须适用于每份样本；按完全酶切处理，
+    **不计单点切开概率**）；全部样本完全酶切后的不同预测长度并集**超过 40 种时
+    拒绝**（HTTP 400）；
+  - 每份样本把**同长度片段的碱基数相加**，再除以该样本全长，得到
+    **单位 DNA 质量的条带份额** a_{i,ℓ}（每行份额之和为 1）；
+  - 录入各**预测长度**对应的**观测份额**：长度为正整数且**不得重复**，份额
+    **非负有限且总和为 1**（1～40 行；**遗漏长度视为份额 0**，不必录入；
+    录入了非预测长度返回 HTTP 400），另传 **0～0.05** 的逐行绝对误差容差；
+  - 设样本**质量配比 w_i ≥ 0、Σw_i = 1**，长度 ℓ 的预测份额为
+    **各样本条带份额的加权和** p_ℓ = Σ_i w_i·a_{i,ℓ}，要求**逐行**
+    |p_ℓ − o_ℓ| ≤ 容差；
+  - 用**连续线性规划（两阶段单纯形 + Bland 规则，非离散网格近似）**求可行域：
+    先解 min max_ℓ |p_ℓ − o_ℓ| 得到**理论最小逐行最大误差 t\***（t\* > 容差即无解），
+    有解时以该最优顶点作为**一组可行配比**，再对每份样本分别解 min/max w_i
+    得到其**可行配比的最小值与最大值**及取该端点时的**预测条带**；
+  - 页面与 API 给出各样本单位质量条带份额矩阵、一组可行配比及其逐行预测/误差、
+    各样本配比的最小/最大值与端点预测条带；无解时 HTTP 200 返回
+    `solvable: false`、理论最小逐行最大误差与明确说明。
 
 ## 坐标约定（示例）
 
@@ -703,6 +723,85 @@ curl -s -X POST http://localhost:8000/api/enzyme-activity-calibration \
 # {"detail":"第 2 行与之前的行重复：（长度 6，类型 fragment）；（片段长度, 类型）必须互异"}
 ```
 
+`POST /api/mixture-deconvolution`
+
+混合样本配比反推：录入 2～5 份**线性** DNA（4～5000 bp、仅 A/C/G/T，空白自动忽略），
+共用 1～8 条现有格式的酶规则（`id` / `site` / `offset`；`cut_probability` 与本功能
+无关，可省略——完全酶切不计单点概率），另传 `observations`（1～40 行：`length`
+正整数、不重复且必须是至少一份样本的预测片段长度，`observed` 非负有限、各行总和
+为 1；**遗漏长度视为观测份额 0**）与 `tolerance`（**0～0.05** 逐行绝对误差容差）。
+
+```json
+{
+  "samples": [
+    {"sequence": "AAAGATATCGGGGATATCTTTGATATCAAA"},
+    {"sequence": "AAAAAAGATATCAAAAAA"}
+  ],
+  "enzymes": [
+    {"id": "EcoRV-like", "site": "GATATC", "offset": 3}
+  ],
+  "observations": [
+    {"length": 6, "observed": 0.2},
+    {"length": 9, "observed": 0.8}
+  ],
+  "tolerance": 0
+}
+```
+
+上例中样本 1（30 bp）切于 6、15、24，片段 6/9/9/6，单位质量份额为 6 bp→0.4、
+9 bp→0.6；样本 2（18 bp）切于 9，片段 9/9，份额 9 bp→1.0。观测 0.2 / 0.8 恰为
+**50/50** 混合。有解时返回字段：`solvable`（true）、`samples[]`（`index` /
+`length` / `topology`（恒为 linear）/ `cut_count` / `fragment_count`）、
+`enzyme_ids` / `enzyme_count`、`tolerance`、`predicted_length_count`（≤ 40）/
+`predicted_lengths`（升序）、`observations`（输入序）、`sample_bands[]`（每份样本
+在每个预测长度上的 `fragment_count` 与单位质量 `share`，无此长度为 0）、
+`min_max_error`（线性规划求出的理论最小逐行最大误差 t\*）、`feasible_mix`
+（一组可行配比：`weights`（按样本顺序，总和为 1）与 `bands[]`（每行 `length` /
+`observed` / `predicted` / `error`））、`weight_ranges[]`（每份样本的 `min` /
+`max`、`weights_at_min` / `weights_at_max` 与 `min_bands` / `max_bands` 端点预测
+条带）。
+
+```bash
+curl -s -X POST http://localhost:8000/api/mixture-deconvolution \
+  -H 'Content-Type: application/json' \
+  -d '{"samples":[{"sequence":"AAAGATATCGGGGATATCTTTGATATCAAA"},{"sequence":"AAAAAAGATATCAAAAAA"}],"enzymes":[{"id":"E1","site":"GATATC","offset":3}],"observations":[{"length":6,"observed":0.2},{"length":9,"observed":0.8}],"tolerance":0}'
+# ... "solvable":true,"min_max_error":0,
+#     "feasible_mix":{"weights":[0.5,0.5], ...},
+#     "weight_ranges":[{"index":1,"min":0.5,"max":0.5,...},{...}]
+```
+
+容差放宽时可行配比通常为连续区间。如同样两份样本、观测 6 bp=0.3 / 9 bp=0.7、
+容差 0.1，则样本 1 的可行配比为 **0.5～1.0**（样本 2 为 0～0.5），区间端点分别
+给出对应预测条带：
+
+```bash
+curl -s -X POST http://localhost:8000/api/mixture-deconvolution \
+  -H 'Content-Type: application/json' \
+  -d '{"samples":[{"sequence":"AAAGATATCGGGGATATCTTTGATATCAAA"},{"sequence":"AAAAAAGATATCAAAAAA"}],"enzymes":[{"id":"E1","site":"GATATC","offset":3}],"observations":[{"length":6,"observed":0.3},{"length":9,"observed":0.7}],"tolerance":0.1}'
+```
+
+无解时（不存在非负且总和为 1 的配比使逐行误差均不超过容差）返回 HTTP 200、
+`solvable: false`、`min_max_error`（t\*）与 `message` 明确说明；遗漏长度按观测
+份额 0 计入误差，例如只录 6 bp=1.0（样本 1 必含 9 bp 份额 0.6）时 t\*=0.6：
+
+```bash
+curl -s -X POST http://localhost:8000/api/mixture-deconvolution \
+  -H 'Content-Type: application/json' \
+  -d '{"samples":[{"sequence":"AAAGATATCGGGGATATCTTTGATATCAAA"},{"sequence":"AAAAAAGATATCAAAAAA"}],"enzymes":[{"id":"E1","site":"GATATC","offset":3}],"observations":[{"length":6,"observed":1}],"tolerance":0.05}'
+# {"...","solvable":false,"min_max_error":0.6,
+#  "message":"无解：在容差 ±0.05 下，不存在非负且总和为 1 的质量配比，……理论最小逐行最大误差为 0.6……"}
+```
+
+预测长度并集超过 40 种、观测了非预测长度、份额总和不为 1、容差不在 0～0.05 等
+前提不满足时返回 HTTP 400，`detail` 为中文原因：
+
+```bash
+curl -s -X POST http://localhost:8000/api/mixture-deconvolution \
+  -H 'Content-Type: application/json' \
+  -d '{"samples":[{"sequence":"AAAGATATCGGGGATATCTTTGATATCAAA"},{"sequence":"AAAAAAGATATCAAAAAA"}],"enzymes":[{"id":"E1","site":"GATATC","offset":3}],"observations":[{"length":99,"observed":1}],"tolerance":0.05}'
+# {"detail":"观测长度 99 bp 不是任何样本的预测片段长度；全部预测长度（2 种，升序）为：6, 9"}
+```
+
 ## 不用 Docker 的本地开发
 
 ```bash
@@ -724,8 +823,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 │   ├── rule_inference.py  # 纯函数：未知酶规则反推（候选窗口枚举、多样本严格验证、反向互补等价合并）
 │   ├── discrimination.py  # 纯函数：样本鉴别酶组合（切点复用、枚举非空组合、两两可区分判定、最少用酶）
 │   ├── calibration.py     # 纯函数：酶活性校准（切点单次扫描、概率网格枚举、O(m²) 区间概率求和、可行概率范围）
-│   ├── main.py            # FastAPI：参数校验、/api/digest、/api/partial-digest、/api/synonymous-redesign、/api/digest-inference、/api/fragment-isolation、/api/fragment-assembly、/api/circular-map-reconstruction、/api/enzyme-rule-inference、/api/sample-discrimination、/api/enzyme-activity-calibration、页面路由
-│   └── static/index.html  # 原生 HTML/CSS/JS 单页（含概率输入、丰度表、同义重设计、条带反推、目标片段分离、平切片段拼接、环状双酶图谱重建、未知酶规则反推、样本鉴别酶组合与酶活性校准）
+│   ├── mixture.py         # 纯函数：混合样本配比反推（单位质量条带份额、两阶段单纯形线性规划、可行配比区间端点）
+│   ├── main.py            # FastAPI：参数校验、/api/digest、/api/partial-digest、/api/synonymous-redesign、/api/digest-inference、/api/fragment-isolation、/api/fragment-assembly、/api/circular-map-reconstruction、/api/enzyme-rule-inference、/api/sample-discrimination、/api/enzyme-activity-calibration、/api/mixture-deconvolution、页面路由
+│   └── static/index.html  # 原生 HTML/CSS/JS 单页（含概率输入、丰度表、同义重设计、条带反推、目标片段分离、平切片段拼接、环状双酶图谱重建、未知酶规则反推、样本鉴别酶组合、酶活性校准与混合样本配比反推）
 ├── requirements.txt
 ├── Dockerfile
 ├── docker-compose.yml
